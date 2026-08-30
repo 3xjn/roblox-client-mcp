@@ -7,8 +7,8 @@ description: Use this when connecting a live Roblox client to roblox-client-mcp,
 
 ## Default flow
 
-1. If the MCP host (Cursor `mcp.json`, Claude, etc.) already spawns this server over stdio, do not also start a second process.
-2. Otherwise start from the checkout using what the repo already declares: `package.json` `scripts.start`, then the lockfile (`bun.lock` → bun, `package-lock.json` → npm, `pnpm-lock.yaml` → pnpm). Do not require bun. If none of those work, say so. Do not invent `npx @3xjn/roblox-client-mcp` — the package is private.
+1. If the MCP host already spawns this server over stdio (`mcp.json` command), do not start another process.
+2. Otherwise start from the checkout using `package.json` `scripts.start` and the lockfile that is actually in the repo (`bun.lock` → bun, `package-lock.json` → npm, `pnpm-lock.yaml` → pnpm). Do not assume bun is installed. Do not tell people to `npx` a published package (this package is private).
 3. Stderr prints the token and a Lua snippet. Stdout is MCP — the token is never there.
 4. Copy `agent.lua` into the executor workspace.
 5. Load/paste the snippet in the live client.
