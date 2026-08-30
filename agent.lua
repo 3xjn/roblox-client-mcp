@@ -232,7 +232,7 @@ local function getInstancePath(instance)
 
     local segments = {}
     local current = instance
-    while current.Parent and current.Parent ~= game and current ~= workspace then
+    while current.Parent and current.Parent ~= game and current ~= workspace do
         table.insert(segments, 1, ("[%q]"):format(current.Name))
         current = current.Parent
     end
