@@ -53,9 +53,11 @@ export const requestMessageSchema = z.object({
   id: z.string().min(1).max(64),
   method: z.enum(REQUEST_METHODS),
   params: z.record(z.string(), z.unknown()),
+  timeoutMs: z.number().int().positive().optional(),
 })
 
 export type AgentRequest = z.infer<typeof requestMessageSchema>
+export type AgentCommand = AgentRequest | { type: "cancel"; id: string }
 export type AgentResponse = z.infer<typeof responseMessageSchema>
 export type HttpAgentResponse = AgentResponse & { readonly token: string }
 

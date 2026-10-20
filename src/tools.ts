@@ -60,15 +60,20 @@ export function createMcpServer(bridge: LiveBridge): McpServer {
       inputSchema: listInstancesInput,
       annotations: { readOnlyHint: true, idempotentHint: true },
     },
-    async (input) =>
+    async (input, extra) =>
       textResult(
-        await bridge.request("listInstances", {
-          path: input.path,
-          scope: input.scope,
-          query: input.query ?? "",
-          className: input.className ?? "",
-          limit: input.limit,
-        }),
+        await bridge.request(
+          "listInstances",
+          {
+            path: input.path,
+            scope: input.scope,
+            query: input.query ?? "",
+            className: input.className ?? "",
+            limit: input.limit,
+          },
+          undefined,
+          extra.signal,
+        ),
       ),
   )
 
@@ -81,13 +86,18 @@ export function createMcpServer(bridge: LiveBridge): McpServer {
       inputSchema: listScriptsInput,
       annotations: { readOnlyHint: true, idempotentHint: true },
     },
-    async (input) =>
+    async (input, extra) =>
       textResult(
-        await bridge.request("listScripts", {
-          query: input.query ?? "",
-          scope: input.scope,
-          limit: input.limit,
-        }),
+        await bridge.request(
+          "listScripts",
+          {
+            query: input.query ?? "",
+            scope: input.scope,
+            limit: input.limit,
+          },
+          undefined,
+          extra.signal,
+        ),
       ),
   )
 
@@ -100,7 +110,7 @@ export function createMcpServer(bridge: LiveBridge): McpServer {
       inputSchema: readSourceInput,
       annotations: { readOnlyHint: true, idempotentHint: true },
     },
-    async (input) =>
+    async (input, extra) =>
       textResult(
         await bridge.request(
           "readSource",
@@ -110,6 +120,7 @@ export function createMcpServer(bridge: LiveBridge): McpServer {
             lineCount: input.lineCount,
           },
           120_000,
+          extra.signal,
         ),
       ),
   )
@@ -128,9 +139,14 @@ export function createMcpServer(bridge: LiveBridge): McpServer {
         openWorldHint: true,
       },
     },
-    async (input) =>
+    async (input, extra) =>
       textResult(
-        await bridge.request("eval", { code: input.code, chunkName: input.chunkName }, 120_000),
+        await bridge.request(
+          "eval",
+          { code: input.code, chunkName: input.chunkName },
+          120_000,
+          extra.signal,
+        ),
       ),
   )
 

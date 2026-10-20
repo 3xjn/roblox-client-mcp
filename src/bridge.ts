@@ -10,8 +10,8 @@ import {
   BridgeUnavailableError,
 } from "./errors.js"
 import {
+  type AgentCommand,
   type AgentInfo,
-  type AgentRequest,
   helloMessageSchema,
   parseHttpAgentResponse,
   pollMessageSchema,
@@ -36,10 +36,11 @@ type PendingRequest = {
   readonly resolve: (value: unknown) => void
   readonly reject: (reason: Error) => void
   readonly timeout: ReturnType<typeof setTimeout>
+  readonly cleanup: () => void
 }
 
 type PollWaiter = {
-  resolve(request: AgentRequest | undefined): void
+  resolve(request: AgentCommand | undefined): void
   timeout: ReturnType<typeof setTimeout>
 }
 
@@ -59,6 +60,7 @@ export interface LiveBridge {
     method: RequestMethod,
     params: Readonly<Record<string, unknown>>,
     timeoutMs?: number,
+    signal?: AbortSignal,
   ): Promise<unknown>
   status(): BridgeStatus
   stop(): Promise<void>
@@ -96,7 +98,7 @@ export function startBridge(options: BridgeOptions): LiveBridge {
   const defaultTimeoutMs = options.requestTimeoutMs ?? 30_000
   const pending = new Map<string, PendingRequest>()
   const authTimeouts = new Map<ServerWebSocket<SocketData>, ReturnType<typeof setTimeout>>()
-  const outbound: AgentRequest[] = []
+  const outbound: AgentCommand[] = []
   const waiters: PollWaiter[] = []
   let session: ActiveSession | undefined
   let lastFilePayload = ""
@@ -104,7 +106,7 @@ export function startBridge(options: BridgeOptions): LiveBridge {
 
   function rejectPending(error: Error): void {
     for (const request of pending.values()) {
-      clearTimeout(request.timeout)
+      request.cleanup()
       request.reject(error)
     }
     pending.clear()
@@ -131,7 +133,7 @@ export function startBridge(options: BridgeOptions): LiveBridge {
     return session?.kind === kind && Date.now() - session.lastSeen <= HTTP_IDLE_MS
   }
 
-  function deliverHttp(request: AgentRequest): void {
+  function deliverHttp(request: AgentCommand): void {
     const waiter = waiters.shift()
     if (waiter !== undefined) {
       waiter.resolve(request)
@@ -140,7 +142,7 @@ export function startBridge(options: BridgeOptions): LiveBridge {
     outbound.push(request)
   }
 
-  function takeOutbound(waitMs: number): Promise<AgentRequest | undefined> {
+  function takeOutbound(waitMs: number): Promise<AgentCommand | undefined> {
     const queued = outbound.shift()
     if (queued !== undefined) {
       return Promise.resolve(queued)
@@ -172,7 +174,7 @@ export function startBridge(options: BridgeOptions): LiveBridge {
     if (request === undefined) {
       return true
     }
-    clearTimeout(request.timeout)
+    request.cleanup()
     pending.delete(response.data.id)
     if (response.data.ok) {
       request.resolve(response.data.result)
@@ -389,7 +391,7 @@ export function startBridge(options: BridgeOptions): LiveBridge {
       }
       return { connected: false }
     },
-    async request(method, params, timeoutMs = defaultTimeoutMs) {
+    async request(method, params, timeoutMs = defaultTimeoutMs, signal) {
       const current = session
       if (
         current === undefined ||
@@ -399,22 +401,65 @@ export function startBridge(options: BridgeOptions): LiveBridge {
         throw new BridgeUnavailableError()
       }
 
+      signal?.throwIfAborted()
       const id = crypto.randomUUID()
-      const agentRequest: AgentRequest = { type: "request", id, method, params }
-      return await new Promise<unknown>((resolve, reject) => {
-        const timeout = setTimeout(() => {
-          pending.delete(id)
-          reject(new BridgeTimeoutError(id, timeoutMs))
-        }, timeoutMs)
-        pending.set(id, { resolve, reject, timeout })
-        if (current.kind === "websocket") {
-          current.socket.send(JSON.stringify(agentRequest))
-        } else if (current.kind === "http") {
-          deliverHttp(agentRequest)
-        } else {
-          void writeAgentFile(agentRequest)
-        }
-      })
+      const started = Date.now()
+      const log = (event: string) =>
+        console.error(
+          JSON.stringify({
+            component: "roblox-client-mcp",
+            event,
+            id,
+            method,
+            elapsedMs: Date.now() - started,
+          }),
+        )
+      const send = (command: AgentCommand) => {
+        if (current.kind === "websocket") current.socket.send(JSON.stringify(command))
+        else if (current.kind === "http") deliverHttp(command)
+        else void writeAgentFile(command).catch(() => cancel("delivery-error"))
+      }
+      let cancel: (event: string) => void = () => {}
+      log("request-start")
+      try {
+        return await new Promise<unknown>((resolve, reject) => {
+          const cleanup = () => {
+            clearTimeout(timeout)
+            signal?.removeEventListener("abort", aborted)
+          }
+          cancel = (event) => {
+            if (!pending.delete(id)) return
+            cleanup()
+            // Never send an old request's cancellation to a replacement session.
+            if (session === current) {
+              const queued = outbound.findIndex((command) => command.id === id)
+              if (queued !== -1) outbound.splice(queued, 1)
+              try {
+                send({ type: "cancel", id })
+              } catch {
+                /* disconnected */
+              }
+            }
+            log(event)
+            reject(
+              event === "timeout"
+                ? new BridgeTimeoutError(id, timeoutMs)
+                : new Error(`Request ${event}`),
+            )
+          }
+          const aborted = () => cancel("cancelled")
+          const timeout = setTimeout(() => cancel("timeout"), timeoutMs)
+          pending.set(id, { resolve, reject, timeout, cleanup })
+          signal?.addEventListener("abort", aborted, { once: true })
+          try {
+            send({ type: "request", id, method, params, timeoutMs })
+          } catch {
+            cancel("delivery-error")
+          }
+        })
+      } finally {
+        log("request-end")
+      }
     },
     async stop() {
       if (fileTimer !== undefined) {

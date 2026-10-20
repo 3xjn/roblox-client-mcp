@@ -637,6 +637,8 @@ end
 local stopped = false
 local socket
 local inFlight = 0
+local jobs = {}
+local evalBusy = false
 local transportName = "websocket"
 
 local function capabilities()
@@ -716,25 +718,84 @@ local function respond(id, succeeded, value)
     return payload
 end
 
-local function handleRequest(request)
-    if type(request) ~= "table" or request.type ~= "request" then
-        return
-    end
-    if type(request.id) ~= "string" or type(request.method) ~= "string" then
-        return
-    end
-    local handler = handlers[request.method]
-    if not handler then
-        return respond(request.id, false, "Unknown method: " .. request.method)
-    end
-    if inFlight >= 8 then
-        return respond(request.id, false, "Too many live requests")
-    end
+-- Log only lifecycle metadata, never code, results, tokens, or error payloads.
+local function trace(job, event)
+    print(string.format("[roblox-client-mcp] %s id=%s method=%s elapsedMs=%d",
+        event, job.id, job.method, math.floor((os.clock() - job.started) * 1000)))
+end
 
+local function cancelAllJobs(event)
+    for id, job in pairs(jobs) do
+        pcall(task.cancel, job.thread)
+        if job.timer then pcall(task.cancel, job.timer) end
+        trace(job, event)
+        jobs[id] = nil
+    end
+    inFlight = 0
+    evalBusy = false
+end
+
+local function handleRequest(request, deliver)
+    if type(request) ~= "table" or type(request.id) ~= "string" then
+        return
+    end
+    local function finish(job, succeeded, result, event)
+        if jobs[job.id] ~= job then return end
+        jobs[job.id] = nil
+        inFlight -= 1
+        if job.method == "eval" then evalBusy = false end
+        if job.timer then pcall(task.cancel, job.timer) end
+        trace(job, event)
+        local payload = respond(job.id, succeeded, result)
+        if deliver then deliver(payload) end
+    end
+    if request.type == "cancel" then
+        local job = jobs[request.id]
+        if job then
+            local cancelled = pcall(task.cancel, job.thread)
+            if cancelled then
+                finish(job, false, "Request cancelled", "cancelled")
+            else
+                trace(job, "cancel-failed")
+            end
+        end
+        return
+    end
+    if stopped or request.type ~= "request" or type(request.method) ~= "string" then return end
+    if jobs[request.id] then return end
+    local handler = handlers[request.method]
+    local reason
+    if not handler then reason = "Unknown method"
+    elseif inFlight >= 8 then reason = "Too many live requests"
+    elseif request.method == "eval" and evalBusy then reason = "Another evaluation is still running" end
+    if reason then
+        local payload = respond(request.id, false, reason)
+        if deliver then deliver(payload) end
+        return
+    end
+    local job = { id = request.id, method = request.method, started = os.clock() }
+    jobs[job.id] = job
     inFlight += 1
-    local succeeded, result = pcall(handler, request.params or {})
-    inFlight -= 1
-    return respond(request.id, succeeded, result)
+    if job.method == "eval" then evalBusy = true end
+    trace(job, "start")
+    local timeoutMs = tonumber(request.timeoutMs) or 30000
+    if timeoutMs ~= timeoutMs then timeoutMs = 30000 end
+    timeoutMs = math.clamp(timeoutMs, 1, 120000)
+    -- Defer keeps user code off the executor's socket callback stack.
+    job.thread = task.defer(function()
+        local succeeded, result = pcall(handler, request.params or {})
+        finish(job, succeeded, result, succeeded and "complete" or "failed")
+    end)
+    job.timer = task.delay(timeoutMs / 1000, function()
+        job.timer = nil
+        local cancelled = pcall(task.cancel, job.thread)
+        if cancelled then
+            finish(job, false, "Request timed out", "timeout")
+        else
+            -- Keep this job registered so a failed cancellation cannot unlock eval.
+            trace(job, "cancel-failed")
+        end
+    end)
 end
 
 local function handleMessage(message, isBinary)
@@ -813,6 +874,7 @@ local function attachSocket(connection)
                 connection:Close()
             end)
             socket = nil
+            cancelAllJobs("disconnected")
         end)
     end
     return true
@@ -858,11 +920,8 @@ local function runHttp()
         if not message then
             return true
         end
-        if message.type == "request" then
-            local payload = handleRequest(message)
-            if payload then
-                httpCall(payload)
-            end
+        if message.type == "request" or message.type == "cancel" then
+            handleRequest(message, httpCall)
         elseif message.type ~= "idle" then
             return true
         end
@@ -892,12 +951,11 @@ local function runFile()
             local message = decodeJson(contents)
             if message and message.type == "ready" then
                 connected = true
-            elseif message and message.type == "request" then
+            elseif message and (message.type == "request" or message.type == "cancel") then
                 connected = true
-                local payload = handleRequest(message)
-                if payload then
+                handleRequest(message, function(payload)
                     fileWrite(toHostPath, HttpService:JSONEncode(payload))
-                end
+                end)
             end
         else
             idle += 0.2
@@ -926,6 +984,7 @@ local agent = {}
 
 function agent.Stop()
     stopped = true
+    cancelAllJobs("stopped")
     if socket then
         pcall(function()
             socket:Close()

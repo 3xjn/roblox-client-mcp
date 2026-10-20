@@ -125,3 +125,24 @@ flowchart LR
 ```
 bun run check
 ```
+
+## Request lifecycle and hang diagnostics
+
+Agent requests execute in deferred tasks, outside the WebSocket callback and polling loops.
+Only one `eval` can run at a time. Each request has a client watchdog (at most 120 seconds).
+MCP cancellation and host timeouts send a cancellation command; the agent attempts to cancel
+the task and suppresses late completion. Stopping or disconnecting the WebSocket agent also
+cancels its pending tasks.
+
+The host writes request start/end, cancellation, and timeout metadata to stderr. The agent
+prints matching request IDs, methods, lifecycle events, and elapsed milliseconds to the
+Roblox log. Code, tokens, returned values, and error payloads are excluded from these logs.
+The last unmatched start identifies the request to investigate, not necessarily the exact
+native operation within it.
+
+Cancellation is cooperative with the Roblox scheduler. It cannot interrupt a native engine
+call that locks the process, or a non-yielding loop that prevents the watchdog from running.
+Use bounded diagnostics and avoid concurrent asset-loading evaluations.
+
+Updating this source does not hot-reload an already running host or injected agent. Restart
+the host and load the updated `agent.lua` when ready to use the changes.
