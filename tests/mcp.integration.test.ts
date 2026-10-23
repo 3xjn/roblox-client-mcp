@@ -11,6 +11,9 @@ import { requestMessageSchema } from "../src/protocol.js"
 const TOKEN = "abcdef0123456789abcdef0123456789"
 const AGENT = {
   agentVersion: "integration",
+  sessionId: "integration-session",
+  capabilities: {},
+  limits: {},
   placeId: 321,
   jobId: "integration-job",
   playerName: "Builder",
@@ -19,11 +22,15 @@ const AGENT = {
 const SCRIPT_RESULT = {
   scripts: [
     {
+      ref: "integration-session:1",
+      childCount: 0,
+      isScript: true,
       name: "DoorManager",
       className: "LocalScript",
       path: 'game:GetService("Players")["Builder"]["PlayerScripts"]["DoorManager"]',
     },
   ],
+  coverage: { complete: true, scanned: 1, limitReached: false, sources: [] },
   total: 1,
   returned: 1,
   scope: "all",
@@ -89,8 +96,8 @@ function childEnvironment(
       environment[key] = value
     }
   }
-  environment.ROBLOX_CLIENT_MCP_TOKEN = TOKEN
-  environment.ROBLOX_CLIENT_MCP_PORT = String(port)
+  environment["ROBLOX_CLIENT_MCP_TOKEN"] = TOKEN
+  environment["ROBLOX_CLIENT_MCP_PORT"] = String(port)
   return { ...environment, ...extra }
 }
 
@@ -102,8 +109,8 @@ async function openStdioClient(
   transport: StdioClientTransport
 }> {
   const httpPort =
-    extra !== undefined && extra.ROBLOX_CLIENT_MCP_HTTP_PORT !== undefined
-      ? extra.ROBLOX_CLIENT_MCP_HTTP_PORT
+    extra !== undefined && extra["ROBLOX_CLIENT_MCP_HTTP_PORT"] !== undefined
+      ? extra["ROBLOX_CLIENT_MCP_HTTP_PORT"]
       : String(await getUnusedPort())
   const transport = new StdioClientTransport({
     command: process.execPath,
@@ -153,7 +160,7 @@ test("serves a live client response through the stdio MCP transport", async () =
     await waitForOpen(socket)
     const ready = waitForMessage(socket)
     socket.send(JSON.stringify({ type: "hello", token: TOKEN, agent: AGENT }))
-    expect(await ready).toEqual({ type: "ready" })
+    expect(await ready).toEqual({ type: "ready", sessionId: AGENT.sessionId })
 
     const requestReceived = waitForMessage(socket)
     const toolResult = client.callTool({
@@ -163,7 +170,13 @@ test("serves a live client response through the stdio MCP transport", async () =
     const request = requestMessageSchema.parse(await requestReceived)
     expect(request.method).toBe("listScripts")
     socket.send(
-      JSON.stringify({ type: "response", id: request.id, ok: true, result: SCRIPT_RESULT }),
+      JSON.stringify({
+        type: "response",
+        sessionId: AGENT.sessionId,
+        id: request.id,
+        ok: true,
+        result: SCRIPT_RESULT,
+      }),
     )
     await expectDoorManager(toolResult)
   } finally {
@@ -184,7 +197,7 @@ test("serves a live client response over HTTP poll", async () => {
       body: JSON.stringify({ type: "hello", token: TOKEN, agent: AGENT }),
     })
     expect(hello.status).toBe(200)
-    expect(await hello.json()).toEqual({ type: "ready" })
+    expect(await hello.json()).toEqual({ type: "ready", sessionId: AGENT.sessionId })
 
     const toolResult = client.callTool({
       name: "roblox_list_scripts",
@@ -192,7 +205,7 @@ test("serves a live client response over HTTP poll", async () => {
     })
     const poll = await fetch(endpoint, {
       method: "POST",
-      body: JSON.stringify({ type: "poll", token: TOKEN }),
+      body: JSON.stringify({ type: "poll", token: TOKEN, sessionId: AGENT.sessionId }),
     })
     const request = requestMessageSchema.parse(await poll.json())
     expect(request.method).toBe("listScripts")
@@ -200,6 +213,7 @@ test("serves a live client response over HTTP poll", async () => {
       method: "POST",
       body: JSON.stringify({
         type: "response",
+        sessionId: AGENT.sessionId,
         token: TOKEN,
         id: request.id,
         ok: true,
@@ -231,7 +245,7 @@ test("serves a live client response over ROBLOX_CLIENT_MCP_FILEPOLL", async () =
           typeof value === "object" && value !== null && "type" in value && value.type === "ready"
         )
       }),
-    ).toEqual({ type: "ready" })
+    ).toEqual({ type: "ready", sessionId: AGENT.sessionId })
 
     const toolResult = client.callTool({
       name: "roblox_list_scripts",
@@ -249,6 +263,7 @@ test("serves a live client response over ROBLOX_CLIENT_MCP_FILEPOLL", async () =
       toHost,
       JSON.stringify({
         type: "response",
+        sessionId: AGENT.sessionId,
         token: TOKEN,
         id: request.id,
         ok: true,

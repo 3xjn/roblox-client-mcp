@@ -34,7 +34,7 @@ function isolatedEnv(overrides: Record<string, string> = {}): Record<string, str
   }
   const merged = { ...environment, ...overrides }
   if ("XDG_CONFIG_HOME" in overrides && !("LOCALAPPDATA" in overrides)) {
-    delete merged.LOCALAPPDATA
+    delete merged["LOCALAPPDATA"]
   }
   return merged
 }
