@@ -12,7 +12,7 @@ const bridge: LiveBridge = {
   port: 0,
   async request(method, params) {
     requests.push({ method, params })
-    return { accepted: true, method }
+    return { values: [1], count: 1, returned: 1, truncated: false }
   },
   status() {
     return { connected: false }
@@ -96,7 +96,7 @@ test("HTTP MCP rejects missing and wrong Bearer tokens", async () => {
   expect(wrong.status).toBe(401)
 })
 
-test("HTTP MCP initializes and lists the four tools", async () => {
+test("HTTP MCP initializes and lists the eight tools", async () => {
   const server = await startOnUnusedPort()
   const init = await rpc(server.port, {
     jsonrpc: "2.0",
@@ -124,9 +124,13 @@ test("HTTP MCP initializes and lists the four tools", async () => {
   ).map((tool) => tool.name)
   expect(names.sort()).toEqual([
     "roblox_eval",
+    "roblox_inspect",
     "roblox_list_instances",
     "roblox_list_scripts",
     "roblox_read_source",
+    "roblox_search_source",
+    "roblox_status",
+    "roblox_validate",
   ])
 })
 

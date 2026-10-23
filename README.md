@@ -77,7 +77,7 @@ it.
 
 Other local agents can POST `http://127.0.0.1:$HTTP_PORT/mcp` with
 `Authorization: Bearer <token>` — the same token as the live bridge, same
-four tools. This is not the Lua agent's `/live/poll`.
+eight tools. This is not the Lua agent's `/live/poll`.
 
 ### 2. Load the agent
 
@@ -101,48 +101,43 @@ with `writefile`/`readfile` under `roblox-client-mcp/` in the executor
 workspace. If you land on file-poll, point `ROBLOX_CLIENT_MCP_FILEPOLL` at
 that directory on the host.
 
+## Runtime workflow
+
+1. Call `roblox_status` to establish the live target, session, capabilities and limits.
+2. Find candidates with `roblox_list_scripts` or `roblox_list_instances`; use the returned `ref` to inspect or recover evidence.
+3. Search recovered evidence with `roblox_search_source`; expand an explicit candidate set when cache coverage is insufficient.
+4. Write against observed contracts and call `roblox_validate` for syntax.
+5. If execution is requested, use `roblox_eval` and verify the requested behavior with an observation or assertion.
+
+Setup procedures are in [the setup skill](skills/live-client-setup/SKILL.md), separate from ordinary runtime work. Keep the host and copied `agent.lua` at the same revision; protocol 0.2 requires a live-agent session ID.
+
 ## Tools
 
-Each tool returns JSON text. Tools fail if no authenticated client is
-connected.
+Successful tools return compact JSON text and the same checked `structuredContent`, with advertised `outputSchema`. Failures use MCP `isError` and a bounded diagnostic. `roblox_status` works while disconnected; the other operations need an authenticated live agent.
 
-| Tool | Returns |
+| Tool | Contract |
 | --- | --- |
-| `roblox_list_instances` | An instance plus matches (`name`, `className`, `path`, `childCount`, `isScript`). Optional `path` (default `game`), `scope` (`children` / `all` / `nil`), `query`, `className`, and `limit`. |
-| `roblox_list_scripts` | Matching scripts (`name`, `className`, `path`). Optional `query`, `scope` (`all` / `running` / `loaded` / `cached`), and `limit`. |
-| `roblox_read_source` | `{ kind, data }`. Tries decompile, then bytecode, then constants, else empty (`luau` / `bytecode` / `constants` / `empty`). |
-| `roblox_eval` | JSON-safe values from an explicit Luau chunk. Destructive. |
+| `roblox_status` | Bridge-local connection state, session ID, place/job, versions, transport, capabilities and limits; no client round trip. |
+| `roblox_list_instances` | `children` defaults to game children. `all` without a root is global; optional `ref`/`path` restricts to that root and descendants. `nil` inspects nil getter roots and their detached descendants. Ranked rows, coverage and `nextCursor`. |
+| `roblox_list_scripts` | Client-visible `all`, or exact getter scopes `running`, `loaded`, `cached`. Ranked rows, coverage and `nextCursor`. |
+| `roblox_read_source` | Exactly one `ref` or unambiguous `path`; decompiled Luau with line/column continuation, constants, or unavailable evidence. `refresh` retries; bytecode requires explicit `representation: "bytecode"`. |
+| `roblox_search_source` | Literal, case-sensitive source/constant search; `cached` by default. `expand` recovers at most `maxScripts` from `refs` or an inventory scope each call. Returns evidence locations, coverage and continuation. |
+| `roblox_inspect` | Selected properties (1–20), optional attributes/tags/ancestry; explicit per-field failures. Never requires a module. |
+| `roblox_validate` | Compile without invocation. `valid` establishes syntax only. |
+| `roblox_eval` | Execute an explicit chunk; preserves nil positions and total return count, with bounded values and traceback diagnostics. Completion does not verify later callbacks. |
 
-```mermaid
-flowchart LR
-  decompile["decompile"] --> bytecode["bytecode"]
-  bytecode --> constants["constants"]
-  constants --> empty["empty"]
-```
+References identify exact observed instances, including duplicate sibling names and detached objects. They are shared across MCP clients using the same live agent, weakly held, bounded, and invalidated when that agent is replaced. They are diagnostic handles, not permanent locators for generated scripts. Paths are descriptive; ambiguous path input fails.
+
+Capability presence permits an attempt, not a guarantee. Read `coverage`: unavailable getters, failed getters, successful empty inventories and partially processed inventories are distinct. A zero-match cache-only or partial search is not proof of absence. Only decompiled matches have source line numbers; a constant match is not proof of behavior.
+
+See [runtime contracts and limits](docs/runtime-contracts.md) and [the reproducible benchmark](docs/benchmark.md).
 
 ## Development
 
 ```
+bun install
 bun run check
+bun run benchmark
 ```
 
-## Request lifecycle and hang diagnostics
-
-Agent requests execute in deferred tasks, outside the WebSocket callback and polling loops.
-Only one `eval` can run at a time. Each request has a client watchdog (at most 120 seconds).
-MCP cancellation and host timeouts send a cancellation command; the agent attempts to cancel
-the task and suppresses late completion. Stopping or disconnecting the WebSocket agent also
-cancels its pending tasks.
-
-The host writes request start/end, cancellation, and timeout metadata to stderr. The agent
-prints matching request IDs, methods, lifecycle events, and elapsed milliseconds to the
-Roblox log. Code, tokens, returned values, and error payloads are excluded from these logs.
-The last unmatched start identifies the request to investigate, not necessarily the exact
-native operation within it.
-
-Cancellation is cooperative with the Roblox scheduler. It cannot interrupt a native engine
-call that locks the process, or a non-yielding loop that prevents the watchdog from running.
-Use bounded diagnostics and avoid concurrent asset-loading evaluations.
-
-Updating this source does not hot-reload an already running host or injected agent. Restart
-the host and load the updated `agent.lua` when ready to use the changes.
+`check` includes TypeScript, Biome, compilation of the actual `agent.lua` using pinned Luau WASM, and transport/MCP/actual-Lua fixture tests. The fixture is a small client surface, not a full Roblox simulator. Live executor verification and model-run benchmark steps are documented separately.

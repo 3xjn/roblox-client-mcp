@@ -4,6 +4,8 @@ import { join } from "node:path"
 import type { ServerWebSocket } from "bun"
 import {
   AgentRequestError,
+  BridgeBusyError,
+  BridgeCancelledError,
   BridgeDisconnectedError,
   BridgeStartupError,
   BridgeTimeoutError,
@@ -12,6 +14,7 @@ import {
 import {
   type AgentCommand,
   type AgentInfo,
+  type AgentRequest,
   helloMessageSchema,
   parseHttpAgentResponse,
   pollMessageSchema,
@@ -25,6 +28,7 @@ const STOP_GRACE_MS = 100
 const POLL_WAIT_MS = 2_000
 const HTTP_IDLE_MS = 15_000
 const FILE_POLL_MS = 100
+export const MAX_PENDING_REQUESTS = 8
 export const BRIDGE_PATH = "/live"
 export const POLL_PATH = "/live/poll"
 
@@ -99,10 +103,14 @@ export function startBridge(options: BridgeOptions): LiveBridge {
   const pending = new Map<string, PendingRequest>()
   const authTimeouts = new Map<ServerWebSocket<SocketData>, ReturnType<typeof setTimeout>>()
   const outbound: AgentCommand[] = []
+  const queued: AgentRequest[] = []
   const waiters: PollWaiter[] = []
   let session: ActiveSession | undefined
   let lastFilePayload = ""
   let fileTimer: ReturnType<typeof setInterval> | undefined
+  // Keep the wire slot until its response, even if the caller times out: executing
+  // cancellation is best effort and must be acknowledged by the client.
+  let dispatchedId: string | undefined
 
   function rejectPending(error: Error): void {
     for (const request of pending.values()) {
@@ -110,10 +118,12 @@ export function startBridge(options: BridgeOptions): LiveBridge {
       request.reject(error)
     }
     pending.clear()
+    dispatchedId = undefined
   }
 
   function clearWaiters(): void {
     outbound.length = 0
+    queued.length = 0
     for (const waiter of waiters.splice(0)) {
       waiter.resolve(undefined)
     }
@@ -130,7 +140,13 @@ export function startBridge(options: BridgeOptions): LiveBridge {
   }
 
   function pollSessionAlive(kind: "http" | "file"): boolean {
-    return session?.kind === kind && Date.now() - session.lastSeen <= HTTP_IDLE_MS
+    return (
+      session?.kind === kind &&
+      (Date.now() - session.lastSeen <= HTTP_IDLE_MS ||
+        // File clients cannot heartbeat while an executor primitive is yielding.
+        // A bounded live request keeps its session alive until its caller deadline.
+        (kind === "file" && dispatchedId !== undefined && pending.has(dispatchedId)))
+    )
   }
 
   function deliverHttp(request: AgentCommand): void {
@@ -140,6 +156,27 @@ export function startBridge(options: BridgeOptions): LiveBridge {
       return
     }
     outbound.push(request)
+  }
+
+  function dispatchNext(): void {
+    if (dispatchedId !== undefined || session === undefined) return
+    const request = queued.shift()
+    if (request === undefined) return
+    dispatchedId = request.id
+    const current = session
+    try {
+      if (current.kind === "websocket") {
+        current.socket.send(JSON.stringify(request))
+      } else if (current.kind === "http") {
+        deliverHttp(request)
+      } else {
+        void writeAgentFile(request).catch(() => {
+          if (session === current) dropSession()
+        })
+      }
+    } catch {
+      dropSession()
+    }
   }
 
   function takeOutbound(waitMs: number): Promise<AgentCommand | undefined> {
@@ -167,11 +204,14 @@ export function startBridge(options: BridgeOptions): LiveBridge {
 
   function acceptResponse(raw: unknown): boolean {
     const response = responseMessageSchema.safeParse(raw)
-    if (!response.success) {
+    if (!response.success || response.data.sessionId !== session?.agent.sessionId) {
       return false
     }
     const request = pending.get(response.data.id)
+    if (response.data.id !== dispatchedId) return true
+    dispatchedId = undefined
     if (request === undefined) {
+      dispatchNext()
       return true
     }
     request.cleanup()
@@ -181,6 +221,7 @@ export function startBridge(options: BridgeOptions): LiveBridge {
     } else {
       request.reject(new AgentRequestError(response.data.id, response.data.error))
     }
+    dispatchNext()
     return true
   }
 
@@ -206,18 +247,27 @@ export function startBridge(options: BridgeOptions): LiveBridge {
       if (!tokenMatches(hello.data.token, options.token)) {
         return jsonResponse(401, { type: "error", error: "Authentication failed" })
       }
-      dropSession()
-      session = {
-        kind: "http",
-        agent: { ...hello.data.agent, transport: "http" },
-        lastSeen: Date.now(),
+      if (session?.kind === "http" && session.agent.sessionId === hello.data.agent.sessionId) {
+        session.agent = { ...hello.data.agent, transport: "http" }
+        session.lastSeen = Date.now()
+      } else {
+        dropSession()
+        session = {
+          kind: "http",
+          agent: { ...hello.data.agent, transport: "http" },
+          lastSeen: Date.now(),
+        }
       }
-      return jsonResponse(200, { type: "ready" })
+      return jsonResponse(200, { type: "ready", sessionId: hello.data.agent.sessionId })
     }
 
     const poll = pollMessageSchema.safeParse(raw)
     if (poll.success) {
-      if (!tokenMatches(poll.data.token, options.token) || !pollSessionAlive("http")) {
+      if (
+        !tokenMatches(poll.data.token, options.token) ||
+        !pollSessionAlive("http") ||
+        session?.agent.sessionId !== poll.data.sessionId
+      ) {
         return jsonResponse(401, { type: "error", error: "Authentication failed" })
       }
       if (session?.kind === "http") {
@@ -229,7 +279,11 @@ export function startBridge(options: BridgeOptions): LiveBridge {
 
     const response = parseHttpAgentResponse(raw)
     if (response !== undefined) {
-      if (!tokenMatches(response.token, options.token) || !pollSessionAlive("http")) {
+      if (
+        !tokenMatches(response.token, options.token) ||
+        !pollSessionAlive("http") ||
+        session?.agent.sessionId !== response.sessionId
+      ) {
         return jsonResponse(401, { type: "error", error: "Authentication failed" })
       }
       if (session?.kind === "http") {
@@ -250,13 +304,18 @@ export function startBridge(options: BridgeOptions): LiveBridge {
       if (!tokenMatches(hello.data.token, options.token)) {
         return
       }
-      dropSession()
-      session = {
-        kind: "file",
-        agent: { ...hello.data.agent, transport: "file" },
-        lastSeen: Date.now(),
+      if (session?.kind === "file" && session.agent.sessionId === hello.data.agent.sessionId) {
+        session.agent = { ...hello.data.agent, transport: "file" }
+        session.lastSeen = Date.now()
+      } else {
+        dropSession()
+        session = {
+          kind: "file",
+          agent: { ...hello.data.agent, transport: "file" },
+          lastSeen: Date.now(),
+        }
       }
-      await writeAgentFile({ type: "ready" })
+      await writeAgentFile({ type: "ready", sessionId: hello.data.agent.sessionId })
       return
     }
 
@@ -264,7 +323,9 @@ export function startBridge(options: BridgeOptions): LiveBridge {
     if (response === undefined || !tokenMatches(response.token, options.token)) {
       return
     }
-    if (!pollSessionAlive("file") && session?.kind !== "file") {
+    // A result or cancellation acknowledgement may arrive after a long call or
+    // its deadline. It can revive only this exact file session, never replace it.
+    if (session?.kind !== "file" || session.agent.sessionId !== response.sessionId) {
       return
     }
     if (session?.kind === "file") {
@@ -350,10 +411,14 @@ export function startBridge(options: BridgeOptions): LiveBridge {
             socket,
             agent: { ...hello.data.agent, transport: "websocket" },
           }
-          socket.send(JSON.stringify({ type: "ready" }))
+          socket.send(JSON.stringify({ type: "ready", sessionId: hello.data.agent.sessionId }))
           return
         }
 
+        if (session?.kind !== "websocket" || session.socket !== socket) {
+          socket.close(1008, "Session replaced")
+          return
+        }
         if (!acceptResponse(raw)) {
           socket.close(1007, "Invalid response")
         }
@@ -400,9 +465,22 @@ export function startBridge(options: BridgeOptions): LiveBridge {
       ) {
         throw new BridgeUnavailableError()
       }
-
+      if (
+        pending.size + (dispatchedId !== undefined && !pending.has(dispatchedId) ? 1 : 0) >=
+        MAX_PENDING_REQUESTS
+      ) {
+        throw new BridgeBusyError()
+      }
       signal?.throwIfAborted()
       const id = crypto.randomUUID()
+      const agentRequest: AgentRequest = {
+        type: "request",
+        id,
+        method,
+        params,
+        timeoutMs,
+        sessionId: current.agent.sessionId,
+      }
       const started = Date.now()
       const log = (event: string) =>
         console.error(
@@ -414,12 +492,6 @@ export function startBridge(options: BridgeOptions): LiveBridge {
             elapsedMs: Date.now() - started,
           }),
         )
-      const send = (command: AgentCommand) => {
-        if (current.kind === "websocket") current.socket.send(JSON.stringify(command))
-        else if (current.kind === "http") deliverHttp(command)
-        else void writeAgentFile(command).catch(() => cancel("delivery-error"))
-      }
-      let cancel: (event: string) => void = () => {}
       log("request-start")
       try {
         return await new Promise<unknown>((resolve, reject) => {
@@ -427,35 +499,46 @@ export function startBridge(options: BridgeOptions): LiveBridge {
             clearTimeout(timeout)
             signal?.removeEventListener("abort", aborted)
           }
-          cancel = (event) => {
+          const cancel = (event: "timeout" | "cancelled") => {
             if (!pending.delete(id)) return
             cleanup()
-            // Never send an old request's cancellation to a replacement session.
-            if (session === current) {
-              const queued = outbound.findIndex((command) => command.id === id)
-              if (queued !== -1) outbound.splice(queued, 1)
+            const queuedIndex = queued.findIndex((request) => request.id === id)
+            if (queuedIndex !== -1) queued.splice(queuedIndex, 1)
+            const outboundIndex = outbound.findIndex((request) => request.id === id)
+            if (outboundIndex !== -1) {
+              outbound.splice(outboundIndex, 1)
+              dispatchedId = undefined
+              dispatchNext()
+            } else if (dispatchedId === id && session === current) {
+              const command: AgentCommand = {
+                type: "cancel",
+                id,
+                sessionId: current.agent.sessionId,
+              }
               try {
-                send({ type: "cancel", id })
+                if (current.kind === "websocket") current.socket.send(JSON.stringify(command))
+                else if (current.kind === "http") deliverHttp(command)
+                else
+                  void writeAgentFile(command).catch(() => {
+                    if (session === current) dropSession()
+                  })
               } catch {
-                /* disconnected */
+                dropSession()
               }
             }
             log(event)
             reject(
               event === "timeout"
                 ? new BridgeTimeoutError(id, timeoutMs)
-                : new Error(`Request ${event}`),
+                : new BridgeCancelledError(),
             )
           }
           const aborted = () => cancel("cancelled")
           const timeout = setTimeout(() => cancel("timeout"), timeoutMs)
           pending.set(id, { resolve, reject, timeout, cleanup })
           signal?.addEventListener("abort", aborted, { once: true })
-          try {
-            send({ type: "request", id, method, params, timeoutMs })
-          } catch {
-            cancel("delivery-error")
-          }
+          queued.push(agentRequest)
+          dispatchNext()
         })
       } finally {
         log("request-end")
